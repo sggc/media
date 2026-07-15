@@ -1,0 +1,184 @@
+name: Build AV3A JNI Library (libav3aJNI.so)
+
+on:
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: "Release tag (e.g. av3a-jni-latest)"
+        required: true
+        default: "av3a-jni-latest"
+
+permissions:
+  contents: write
+
+env:
+  ANDROID_NDK_VERSION: "27.0.12077973"
+
+jobs:
+  build:
+    name: Build libav3aJNI ${{ matrix.arch.name }}
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    strategy:
+      fail-fast: false
+      matrix:
+        arch:
+          - { name: arm64-v8a, abi: arm64-v8a, triple: aarch64-linux-android }
+          - { name: armeabi-v7a, abi: armeabi-v7a, triple: armv7a-linux-androideabi }
+
+    steps:
+      - name: Checkout sggc/media (codec-support branch)
+        uses: actions/checkout@v4
+        with:
+          repository: sggc/media
+          ref: codec-support
+          path: media
+
+      - name: Checkout ijkplayer-av3a (for AVS3 decoder source)
+        uses: actions/checkout@v4
+        with:
+          repository: wuxianlin/ijkplayer-av3a
+          path: ijkplayer-av3a
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential cmake ninja-build nasm yasm
+
+      - name: Set up Android NDK
+        uses: android-actions/setup-android@v3
+
+      - name: Install Android NDK
+        run: |
+          yes | sdkmanager --licenses || true
+          sdkmanager "ndk;${{ env.ANDROID_NDK_VERSION }}"
+          echo "ANDROID_NDK_HOME=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> "$GITHUB_ENV"
+          echo "ANDROID_NDK_ROOT=$ANDROID_HOME/ndk/${{ env.ANDROID_NDK_VERSION }}" >> "$GITHUB_ENV"
+
+      - name: Find AVS3 decoder source
+        run: |
+          echo "=== Searching for AVS3 decoder source ==="
+          find ijkplayer-av3a -name "avs3*" -o -name "av3a*" | head -50
+          echo "=== Searching for avs3_decoder_interface.h ==="
+          find ijkplayer-av3a -name "avs3_decoder_interface.h" 2>/dev/null
+          echo "=== Searching for CMakeLists.txt with av3a ==="
+          find ijkplayer-av3a -name "CMakeLists.txt" -exec grep -l "av3a\|avs3" {} \; 2>/dev/null
+          echo "=== Searching for .so files ==="
+          find ijkplayer-av3a -name "*.so" 2>/dev/null | head -20
+          echo "=== Searching for model.bin ==="
+          find ijkplayer-av3a -name "model.bin" 2>/dev/null
+
+      - name: Find AVS3 decoder source in media repo
+        run: |
+          echo "=== Media repo JNI directory ==="
+          find media/libraries/decoder_av3a -type f | sort
+          echo "=== Media repo av3a_jni.cc content ==="
+          cat media/libraries/decoder_av3a/src/main/jni/av3a_jni.cc
+
+      - name: Build libav3aJNI.so
+        run: |
+          # Create build directory
+          mkdir -p av3a-build && cd av3a-build
+
+          # Determine the AVS3 decoder source directory
+          AVS3_SOURCE=""
+          # Try to find in ijkplayer-av3a
+          AVS3_DIR=$(find ../ijkplayer-av3a -name "avs3_decoder_interface.h" -exec dirname {} \; 2>/dev/null | head -1)
+          if [ -n "$AVS3_DIR" ]; then
+            AVS3_SOURCE=$(dirname "$AVS3_DIR")
+            echo "Found AVS3 decoder source at: $AVS3_SOURCE"
+          fi
+
+          # If not found, try alternative locations
+          if [ -z "$AVS3_SOURCE" ]; then
+            echo "AVS3 decoder source not found in ijkplayer-av3a, searching alternative locations..."
+            # Check if there's a prebuilt .so we can use directly
+            PREBUILT_SO=$(find ../ijkplayer-av3a -name "libav3a*.so" -o -name "libavs3*.so" 2>/dev/null | head -1)
+            if [ -n "$PREBUILT_SO" ]; then
+              echo "Found prebuilt .so: $PREBUILT_SO"
+              mkdir -p ../output/${{ matrix.arch.name }}
+              cp "$PREBUILT_SO" ../output/${{ matrix.arch.name }}/libav3aJNI.so
+              exit 0
+            fi
+            echo "ERROR: Could not find AVS3 decoder source or prebuilt library"
+            exit 1
+          fi
+
+          # Copy JNI source from media repo
+          cp ../media/libraries/decoder_av3a/src/main/jni/av3a_jni.cc .
+
+          # Create CMakeLists.txt
+          cat > CMakeLists.txt << 'CMAKE_EOF'
+          cmake_minimum_required(VERSION 3.10)
+          project(av3aJNI C CXX)
+          set(CMAKE_CXX_STANDARD 14)
+          set(CMAKE_CXX_STANDARD_REQUIRED ON)
+          add_library(av3aJNI SHARED av3a_jni.cc)
+          target_include_directories(av3aJNI PRIVATE ${AVS3_SOURCE})
+          file(GLOB AVS3_SRC ${AVS3_SOURCE}/*.c ${AVS3_SOURCE}/*.cpp)
+          if(AVS3_SRC)
+            add_library(avs3_decoder STATIC ${AVS3_SRC})
+            target_include_directories(avs3_decoder PUBLIC ${AVS3_SOURCE})
+            target_link_libraries(av3aJNI avs3_decoder)
+          endif()
+          find_library(log-lib log)
+          target_link_libraries(av3aJNI ${log-lib})
+          CMAKE_EOF
+
+          # Build with CMake
+          cmake -G Ninja \
+            -DCMAKE_TOOLCHAIN_FILE=$ANDROID_NDK_HOME/build/cmake/android.toolchain.cmake \
+            -DANDROID_ABI=${{ matrix.arch.abi }} \
+            -DANDROID_PLATFORM=android-21 \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DAVS3_SOURCE="$AVS3_SOURCE" \
+            .
+
+          ninja
+
+          # Strip the library
+          $ANDROID_NDK_HOME/toolchains/llvm/prebuilt/linux-x86_64/bin/llvm-strip --strip-unneeded libav3aJNI.so
+
+          # Copy to output
+          mkdir -p ../output/${{ matrix.arch.name }}
+          cp libav3aJNI.so ../output/${{ matrix.arch.name }}/
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: av3a-jni-${{ matrix.arch.name }}
+          path: output/${{ matrix.arch.name }}/libav3aJNI.so
+
+  package:
+    name: Package JNI Libraries
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+
+      - name: Package libraries
+        run: |
+          mkdir -p jniLibs/arm64-v8a jniLibs/armeabi-v7a
+          cp artifacts/av3a-jni-arm64-v8a/libav3aJNI.so jniLibs/arm64-v8a/ || true
+          cp artifacts/av3a-jni-armeabi-v7a/libav3aJNI.so jniLibs/armeabi-v7a/ || true
+          # Create zip
+          cd jniLibs && zip -r ../av3a-jni-libs.zip . && cd ..
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tag_name: ${{ inputs.release_tag }}
+          name: AV3A JNI Library ${{ inputs.release_tag }}
+          generate_release_notes: true
+          draft: false
+          prerelease: false
+          files: av3a-jni-libs.zip
